@@ -1,15 +1,336 @@
 <!DOCTYPE html>
-<html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ハンズフリー英単語帳</title>
+<style>
+  body { font-family: sans-serif; background: #121212; color: #f0f0f0; max-width: 600px; margin: 0 auto; padding: 16px; }
+  button { font-size: 16px; padding: 10px 18px; border: none; border-radius: 6px; cursor: pointer; }
+  input { font-size: 14px; padding: 8px; border-radius: 6px; border: 1px solid #444; background: #1e1e1e; color: #fff; width: 100%; box-sizing: border-box; margin-top: 4px; }
+  .btn-primary { background: #3b82f6; color: #fff; font-weight: bold; }
+  .btn-stop { background: #ef4444; color: #fff; font-weight: bold; }
+  .btn-sub { background: #2a2a2a; color: #ccc; font-size: 13px; padding: 6px 12px; }
+  .topbar { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  #settings-panel { background: #1c1c1c; padding: 12px; border-radius: 8px; margin-top: 12px; font-size: 13px; }
+  #settings-panel label { display: block; margin-top: 8px; color: #aaa; }
+  #player-view { text-align: center; margin-top: 36px; }
+  #word-display { font-size: 40px; font-weight: bold; margin: 16px 0 6px; }
+  #phonetic-display { color: #9ca3af; font-size: 18px; margin-bottom: 20px; }
+  #meaning-display { font-size: 24px; color: #34d399; min-height: 34px; margin-bottom: 10px; }
+  #def-display { font-size: 14px; color: #9ca3af; min-height: 40px; line-height: 1.4; }
+  .review-item { display: flex; justify-content: space-between; align-items: center; background: #1e1e1e; padding: 12px; margin-bottom: 8px; border-radius: 8px; }
+  .ox-group button { width: 48px; margin-left: 6px; font-weight: bold; background: #2d2d2d; color: #888; }
+  .ox-group button.active-o { background: #10b981; color: #fff; }
+  .ox-group button.active-x { background: #ef4444; color: #fff; }
+  .hidden { display: none; }
+</style>
+</head>
 <body>
-  <!-- ここは普通のHTML（ボタンや文字など） -->
-  <button>再生</button>
 
-  <script>
-    // ここから下はJavaScriptのプログラムを書くエリア（タグの中）
-    const GH = {
-      owner: "あなたのユーザー名",
-      // ...
+<div class="topbar">
+  <span id="status-text">読み込み中...</span>
+  <div>
+    <button class="btn-sub" onclick="syncFromGitHub()">再読込</button>
+    <button class="btn-sub" onclick="toggleSettings()">GitHub設定</button>
+  </div>
+</div>
+
+<!-- トークン・リポジトリ設定欄 -->
+<div id="settings-panel" class="hidden">
+  <div style="font-weight:bold; color:#fff;">GitHub Actions 連携設定</div>
+  <label>Fine-grained PAT (Actions: Read and write)
+    <input type="password" id="cfg-token" placeholder="github_pat_...">
+  </label>
+  <label>ユーザー名 (Owner)
+    <input type="text" id="cfg-owner">
+  </label>
+  <label>リポジトリ名 (Repo)
+    <input type="text" id="cfg-repo">
+  </label>
+  <button class="btn-primary" style="width:100%; margin-top:12px;" onclick="saveSettings()">設定を保存</button>
+</div>
+
+<!-- 再生画面 -->
+<div id="player-view">
+  <div id="word-display">Ready</div>
+  <div id="phonetic-display"></div>
+  <div id="meaning-display"></div>
+  <div id="def-display"></div>
+  <div style="margin-top: 32px;">
+    <button id="start-btn" class="btn-primary" onclick="startSession()">再生スタート</button>
+    <button id="stop-btn" class="btn-stop hidden" onclick="stopSession()">停止して 〇× 判定</button>
+  </div>
+</div>
+
+<!-- 停止後の〇×振り分け画面 -->
+<div id="review-view" class="hidden">
+  <h3>今回見た単語（〇をつけると次回から出ません）</h3>
+  <div id="review-list"></div>
+  <button class="btn-primary" style="width:100%; margin-top:16px;" onclick="saveAndReturn()">確定してGitHubに保存</button>
+</div>
+
+<script>
+// 覚えたい単語リスト（ここに追加・編集）
+const WORD_LIST = [
+  { word: "ephemeral", ja: "つかの間の、短命な" },
+  { word: "ubiquitous", ja: "至る所にある、遍在する" },
+  { word: "pragmatic", ja: "実用的な、現実主義の" },
+  { word: "ambiguous", ja: "曖昧な、多義的な" },
+  { word: "resilient", ja: "回復力のある、弾力のある" },
+  { word: "meticulous", ja: "細部まで注意深い、几帳面な" }
+];
+
+const CACHE_KEY = "vocab_dict_cache_v1";
+let masteredSet = new Set();
+let isPlaying = false;
+let timerId = null;
+let currentAudio = null;
+let wakeLock = null;
+let sessionSeen = [];
+let reviewMarks = {};
+
+// URLからGitHubのownerとrepoを自動推測
+function detectRepoInfo() {
+  const hostParts = location.hostname.split(".");
+  const pathParts = location.pathname.split("/").filter(Boolean);
+  const autoOwner = hostParts[1] === "github" ? hostParts[0] : "";
+  const autoRepo = pathParts[0] || "";
+  return {
+    token: localStorage.getItem("gh_pat") || "",
+    owner: localStorage.getItem("gh_owner") || autoOwner,
+    repo: localStorage.getItem("gh_repo") || autoRepo
+  };
+}
+
+function loadSettingsToUI() {
+  const cfg = detectRepoInfo();
+  document.getElementById("cfg-token").value = cfg.token;
+  document.getElementById("cfg-owner").value = cfg.owner;
+  document.getElementById("cfg-repo").value = cfg.repo;
+  if (!cfg.token) {
+    document.getElementById("settings-panel").classList.remove("hidden");
+  }
+}
+
+function toggleSettings() {
+  document.getElementById("settings-panel").classList.toggle("hidden");
+}
+
+function saveSettings() {
+  localStorage.setItem("gh_pat", document.getElementById("cfg-token").value.trim());
+  localStorage.setItem("gh_owner", document.getElementById("cfg-owner").value.trim());
+  localStorage.setItem("gh_repo", document.getElementById("cfg-repo").value.trim());
+  document.getElementById("settings-panel").classList.add("hidden");
+  syncFromGitHub();
+}
+
+function updateStatusText(extra = "") {
+  const remaining = WORD_LIST.filter(item => !masteredSet.has(item.word)).length;
+  document.getElementById("status-text").textContent = `未習得: ${remaining} / ${WORD_LIST.length}語 ${extra}`;
+}
+
+// GitHubのprogress.jsonから習得済み単語を取得
+async function syncFromGitHub() {
+  const { owner, repo } = detectRepoInfo();
+  if (!owner || !repo) {
+    updateStatusText("(設定未完了)");
+    return;
+  }
+  updateStatusText("(同期中...)");
+  try {
+    const url = `https://raw.githubusercontent.com/${owner}/${repo}/main/progress.json?t=${Date.now()}`;
+    const res = await fetch(url);
+    if (res.ok) {
+      const list = await res.json();
+      masteredSet = new Set(list);
+    }
+    updateStatusText();
+  } catch {
+    updateStatusText("(読込失敗)");
+  }
+}
+
+// GitHub Actionsを起動してprogress.jsonに自動コミット
+async function commitToGitHub(newlyMastered) {
+  if (newlyMastered.length === 0) return;
+  const { token, owner, repo } = detectRepoInfo();
+  if (!token || !owner || !repo) {
+    alert("GitHub設定（トークン等）が未入力のため保存できませんでした");
+    return;
+  }
+  const url = `https://api.github.com/repos/${owner}/${repo}/actions/workflows/update-progress.yml/dispatches`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${token}`,
+      "Accept": "application/vnd.github+json",
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      ref: "main",
+      inputs: { mastered_json: JSON.stringify(newlyMastered) }
+    })
+  });
+  if (res.status !== 204) {
+    alert(`保存リクエスト失敗 (HTTP ${res.status})。トークン権限やリポジトリ名を確認してください。`);
+  }
+}
+
+async function fetchDictData(word) {
+  const cache = JSON.parse(localStorage.getItem(CACHE_KEY) || "{}");
+  if (cache[word]) return cache[word];
+  try {
+    const res = await fetch(`https://api.dictionaryapi.dev/api/v2/entries/en/${encodeURIComponent(word)}`);
+    if (!res.ok) return null;
+    const data = await res.json();
+    const entry = data[0];
+    const audioObj = (entry.phonetics || []).find(p => p.audio && p.audio.length > 0);
+    const parsed = {
+      phonetic: entry.phonetic || (audioObj && audioObj.text) || "",
+      audio: audioObj ? audioObj.audio : "",
+      definition: entry.meanings?.[0]?.definitions?.[0]?.definition || ""
     };
-  </script>
+    cache[word] = parsed;
+    localStorage.setItem(CACHE_KEY, JSON.stringify(cache));
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function speakText(text, lang) {
+  return new Promise(resolve => {
+    if (!isPlaying) return resolve();
+    const uttr = new SpeechSynthesisUtterance(text);
+    uttr.lang = lang;
+    uttr.onend = resolve;
+    uttr.onerror = resolve;
+    speechSynthesis.speak(uttr);
+  });
+}
+
+function playAudioUrl(url, fallbackWord) {
+  return new Promise(resolve => {
+    if (!isPlaying) return resolve();
+    if (!url) return speakText(fallbackWord, "en-US").then(resolve);
+    currentAudio = new Audio(url);
+    currentAudio.onended = resolve;
+    currentAudio.onerror = () => speakText(fallbackWord, "en-US").then(resolve);
+    currentAudio.play().catch(() => speakText(fallbackWord, "en-US").then(resolve));
+  });
+}
+
+function wait(ms) {
+  return new Promise(resolve => { timerId = setTimeout(resolve, ms); });
+}
+
+async function startSession() {
+  const queue = WORD_LIST.filter(item => !masteredSet.has(item.word));
+  if (queue.length === 0) {
+    alert("未習得の単語がありません！");
+    return;
+  }
+  isPlaying = true;
+  sessionSeen = [];
+  document.getElementById("start-btn").classList.add("hidden");
+  document.getElementById("stop-btn").classList.remove("hidden");
+  document.getElementById("review-view").classList.add("hidden");
+  document.getElementById("player-view").classList.remove("hidden");
+
+  try { if ("wakeLock" in navigator) wakeLock = await navigator.wakeLock.request("screen"); } catch {}
+
+  let idx = 0;
+  while (isPlaying) {
+    const item = queue[idx % queue.length];
+    if (!sessionSeen.some(s => s.word === item.word)) sessionSeen.push(item);
+
+    document.getElementById("word-display").textContent = item.word;
+    document.getElementById("phonetic-display").textContent = "読み込み中...";
+    document.getElementById("meaning-display").textContent = "";
+    document.getElementById("def-display").textContent = "";
+
+    const dict = await fetchDictData(item.word);
+    if (!isPlaying) break;
+
+    document.getElementById("phonetic-display").textContent = dict?.phonetic || "";
+    await playAudioUrl(dict?.audio, item.word);
+    if (!isPlaying) break;
+
+    await wait(2500);
+    if (!isPlaying) break;
+
+    document.getElementById("meaning-display").textContent = item.ja;
+    document.getElementById("def-display").textContent = dict?.definition || "";
+    await speakText(item.ja, "ja-JP");
+    if (!isPlaying) break;
+
+    await wait(1500);
+    idx++;
+  }
+}
+
+function stopSession() {
+  isPlaying = false;
+  clearTimeout(timerId);
+  speechSynthesis.cancel();
+  if (currentAudio) { currentAudio.pause(); currentAudio = null; }
+  if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
+
+  document.getElementById("player-view").classList.add("hidden");
+  document.getElementById("review-view").classList.remove("hidden");
+
+  reviewMarks = {};
+  const listEl = document.getElementById("review-list");
+  listEl.innerHTML = "";
+
+  sessionSeen.forEach((item, i) => {
+    reviewMarks[item.word] = "x";
+    const row = document.createElement("div");
+    row.className = "review-item";
+    row.innerHTML = `
+      <div>
+        <div style="font-weight:bold; font-size:18px;">${item.word}</div>
+        <div style="font-size:13px; color:#aaa;">${item.ja}</div>
+      </div>
+      <div class="ox-group">
+        <button id="btn-o-${i}" onclick="setMark(${i}, '${item.word}', 'o')">〇</button>
+        <button id="btn-x-${i}" class="active-x" onclick="setMark(${i}, '${item.word}', 'x')">×</button>
+      </div>
+    `;
+    listEl.appendChild(row);
+  });
+}
+
+function setMark(i, word, mark) {
+  reviewMarks[word] = mark;
+  document.getElementById(`btn-o-${i}`).className = mark === "o" ? "active-o" : "";
+  document.getElementById(`btn-x-${i}`).className = mark === "x" ? "active-x" : "";
+}
+
+async function saveAndReturn() {
+  const newlyMastered = [];
+  for (const [word, mark] of Object.entries(reviewMarks)) {
+    if (mark === "o") {
+      masteredSet.add(word);
+      newlyMastered.push(word);
+    }
+  }
+  await commitToGitHub(newlyMastered);
+
+  document.getElementById("review-view").classList.add("hidden");
+  document.getElementById("player-view").classList.remove("hidden");
+  document.getElementById("start-btn").classList.remove("hidden");
+  document.getElementById("stop-btn").classList.add("hidden");
+  document.getElementById("word-display").textContent = "Ready";
+  document.getElementById("phonetic-display").textContent = "";
+  document.getElementById("meaning-display").textContent = "";
+  document.getElementById("def-display").textContent = "";
+  updateStatusText();
+}
+
+loadSettingsToUI();
+syncFromGitHub();
+</script>
 </body>
 </html>
