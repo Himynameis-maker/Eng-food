@@ -36,7 +36,6 @@
   </div>
 </div>
 
-<!-- トークン・リポジトリ設定欄 -->
 <div id="settings-panel" class="hidden">
   <div style="font-weight:bold; color:#fff;">GitHub Actions 連携設定</div>
   <label>Fine-grained PAT (Actions: Read and write)
@@ -51,7 +50,6 @@
   <button class="btn-primary" style="width:100%; margin-top:12px;" onclick="saveSettings()">設定を保存</button>
 </div>
 
-<!-- 再生画面 -->
 <div id="player-view">
   <div id="word-display">Ready</div>
   <div id="phonetic-display"></div>
@@ -63,7 +61,6 @@
   </div>
 </div>
 
-<!-- 停止後の〇×振り分け画面 -->
 <div id="review-view" class="hidden">
   <h3>今回見た単語（〇をつけると次回から出ません）</h3>
   <div id="review-list"></div>
@@ -71,7 +68,6 @@
 </div>
 
 <script>
-// 覚えたい単語リスト（ここに追加・編集）
 const WORD_LIST = [
   { word: "ephemeral", ja: "つかの間の、短命な" },
   { word: "ubiquitous", ja: "至る所にある、遍在する" },
@@ -85,12 +81,12 @@ const CACHE_KEY = "vocab_dict_cache_v1";
 let masteredSet = new Set();
 let isPlaying = false;
 let timerId = null;
-let currentAudio = null;
+let sharedAudio = new Audio();
 let wakeLock = null;
 let sessionSeen = [];
 let reviewMarks = {};
+let activeUtterance = null; // iOSのGC(途中消滅)防止用
 
-// URLからGitHubのownerとrepoを自動推測
 function detectRepoInfo() {
   const hostParts = location.hostname.split(".");
   const pathParts = location.pathname.split("/").filter(Boolean);
@@ -130,7 +126,6 @@ function updateStatusText(extra = "") {
   document.getElementById("status-text").textContent = `未習得: ${remaining} / ${WORD_LIST.length}語 ${extra}`;
 }
 
-// GitHubのprogress.jsonから習得済み単語を取得
 async function syncFromGitHub() {
   const { owner, repo } = detectRepoInfo();
   if (!owner || !repo) {
@@ -151,7 +146,6 @@ async function syncFromGitHub() {
   }
 }
 
-// GitHub Actionsを起動してprogress.jsonに自動コミット
 async function commitToGitHub(newlyMastered) {
   if (newlyMastered.length === 0) return;
   const { token, owner, repo } = detectRepoInfo();
@@ -199,25 +193,51 @@ async function fetchDictData(word) {
   }
 }
 
+// タイムアウト保険付きの読み上げ（iOSでonendが来なくても最大4秒で次へ進む）
 function speakText(text, lang) {
   return new Promise(resolve => {
-    if (!isPlaying) return resolve();
-    const uttr = new SpeechSynthesisUtterance(text);
-    uttr.lang = lang;
-    uttr.onend = resolve;
-    uttr.onerror = resolve;
-    speechSynthesis.speak(uttr);
+    if (!isPlaying || !("speechSynthesis" in window)) return resolve();
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(fallbackTimer);
+      resolve();
+    };
+    const fallbackTimer = setTimeout(finish, Math.max(3000, text.length * 250));
+    try {
+      speechSynthesis.cancel();
+      activeUtterance = new SpeechSynthesisUtterance(text);
+      activeUtterance.lang = lang;
+      activeUtterance.onend = finish;
+      activeUtterance.onerror = finish;
+      speechSynthesis.speak(activeUtterance);
+    } catch {
+      finish();
+    }
   });
 }
 
+// タイムアウト保険付きの音声ファイル再生
 function playAudioUrl(url, fallbackWord) {
   return new Promise(resolve => {
     if (!isPlaying) return resolve();
     if (!url) return speakText(fallbackWord, "en-US").then(resolve);
-    currentAudio = new Audio(url);
-    currentAudio.onended = resolve;
-    currentAudio.onerror = () => speakText(fallbackWord, "en-US").then(resolve);
-    currentAudio.play().catch(() => speakText(fallbackWord, "en-US").then(resolve));
+
+    let done = false;
+    const finish = (useFallback = false) => {
+      if (done) return;
+      done = true;
+      clearTimeout(fallbackTimer);
+      if (useFallback) speakText(fallbackWord, "en-US").then(resolve);
+      else resolve();
+    };
+
+    const fallbackTimer = setTimeout(() => finish(true), 3500);
+    sharedAudio.onended = () => finish(false);
+    sharedAudio.onerror = () => finish(true);
+    sharedAudio.src = url;
+    sharedAudio.play().catch(() => finish(true));
   });
 }
 
@@ -231,6 +251,16 @@ async function startSession() {
     alert("未習得の単語がありません！");
     return;
   }
+
+  // iOS対策: タップ直後に音声APIのロックを同期解除
+  try {
+    if ("speechSynthesis" in window) {
+      const unlockUttr = new SpeechSynthesisUtterance("");
+      speechSynthesis.speak(unlockUttr);
+    }
+    sharedAudio.play().catch(() => {});
+  } catch {}
+
   isPlaying = true;
   sessionSeen = [];
   document.getElementById("start-btn").classList.add("hidden");
@@ -273,8 +303,8 @@ async function startSession() {
 function stopSession() {
   isPlaying = false;
   clearTimeout(timerId);
-  speechSynthesis.cancel();
-  if (currentAudio) { currentAudio.pause(); currentAudio = null; }
+  if ("speechSynthesis" in window) speechSynthesis.cancel();
+  sharedAudio.pause();
   if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
 
   document.getElementById("player-view").classList.add("hidden");
